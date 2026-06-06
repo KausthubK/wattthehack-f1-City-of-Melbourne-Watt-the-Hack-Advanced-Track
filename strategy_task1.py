@@ -348,8 +348,10 @@ class Strategy:
             return 1.00
         if 63 <= time_of_day <= 66:
             return 0.45
-        if 67 <= time_of_day <= 86:
-            return 0.08
+        if 67 <= time_of_day <= 76:
+            return 0.20
+        if 77 <= time_of_day <= 86:
+            return 0.05
         return 0.05
 
     @staticmethod

@@ -348,7 +348,7 @@ class Strategy:
         demand = float(state.get("demand", 0.0))
 
         if 40 <= time_of_day <= 62 and solar > demand:
-            return 0.98
+            return 1.00
         if 63 <= time_of_day <= 66:
             return 0.45
         if 67 <= time_of_day <= 86:
