@@ -151,7 +151,11 @@ def run_playtest(
     )
 
     if verbose:
-        _print_summary(summary, breakdown, wall, out_dir, report_path, scenario_id=spec.get("id", ""))
+        _print_summary(
+            summary, breakdown, wall, out_dir, report_path,
+            scenario_id=spec.get("id", ""),
+            baselines=(spec.get("scoring") or {}).get("baselines") or {},
+        )
 
     if open_report:
         _open_report(report_path)
@@ -739,12 +743,27 @@ def _open_report(path: Path) -> None:
         print(f"  [report] could not open browser: {exc}", file=sys.stderr)
 
 
+def _leaderboard_points(score: float, baselines: dict | None) -> float | None:
+    """Points for a raw cost: 0 at the naive baseline, 100 at optimal, capped 150.
+    None if the scenario ships no naive/optimal baseline."""
+    if not baselines:
+        return None
+    naive = baselines.get("naive_cost")
+    optimal = baselines.get("optimal_cost")
+    if naive is None or optimal is None or naive == optimal:
+        return None
+    return max(0.0, min(150.0, 100.0 * (naive - score) / (naive - optimal)))
+
+
 def _print_summary(
     summary: dict, breakdown: dict, wall_seconds: float, out_dir: Path,
-    report_path: Path, scenario_id: str = "",
+    report_path: Path, scenario_id: str = "", baselines: dict | None = None,
 ) -> None:
     print()
     print(f"final_score          ${summary['final_score']:>12.2f}   (lower wins)")
+    _pts = _leaderboard_points(summary["final_score"], baselines)
+    if _pts is not None:
+        print(f"points (leaderboard) {_pts:>12.1f}   (0=naive, 100=optimal, capped 150)")
     print(f"renewable_ratio       {summary['renewable_ratio']:>12.3f}")
     print(f"unmet_demand_total    {summary['unmet_demand_total']:>12.3f} MWh")
     if summary.get("controller_errors"):
