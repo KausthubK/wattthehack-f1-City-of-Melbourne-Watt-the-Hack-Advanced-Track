@@ -9,3 +9,5 @@ build/
 venv/
 .DS_Store
 Thumbs.db
+
+runs/
