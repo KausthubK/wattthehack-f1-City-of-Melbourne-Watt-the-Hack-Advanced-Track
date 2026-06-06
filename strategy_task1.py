@@ -26,41 +26,51 @@ class ControllerMemory:
         self.last_objective_score: float = 0.0
 
 
+class ObjectiveWeights:
+    def __init__(self) -> None:
+        self.blackout_penalty = 1.0
+        self.overvoltage_penalty = 1.0
+        self.demand_charge = 1.0
+        self.tariff_import = 1.0
+        self.tariff_export = 1.0
+        self.generator_fuel = 1.0
+        self.battery_wear = 1.0
+        self.carbon_cost = 1.0
+        self.ramp_charge = 1.0
+        self.soc_reserve_penalty = 1.0
+
+    def get(self, name: str, default: float = 1.0) -> float:
+        return float(getattr(self, name, default))
+
+
+class ActionCosts:
+    def __init__(self) -> None:
+        self.dt_hours = 0.25
+        self.battery_capacity_mwh = 100.0
+        self.max_inverter_mw = 50.0
+        self.grid_max_import_mw = 120.0
+        self.grid_max_export_mw = 50.0
+        self.charge_efficiency = 0.95
+        self.discharge_efficiency = 0.95
+        self.max_diesel_mw = 50.0
+
+        self.export_tariff_per_mwh = 50.0
+        self.diesel_cost_per_mwh = 1000.0
+        self.blackout_penalty_per_mwh = 100000.0
+        self.overvoltage_penalty_per_mwh = 5000.0
+        self.battery_wear_per_mwh = 50.0
+        self.demand_charge_per_mw = 1000.0
+        self.carbon_price_per_kg = 50.0
+        self.default_grid_co2_kg_per_mwh = 0.7
+        self.diesel_co2_kg_per_mwh = 0.27
+        self.duck_curve_ramp_charge_per_mw2 = 0.01
+
+
 class Strategy:
     """Boilerplate Strategy lifecycle accepted by the playtest runner."""
 
-    DT_HOURS = 0.25
-    BATTERY_CAPACITY_MWH = 100.0
-    MAX_INVERTER_MW = 50.0
-    GRID_MAX_IMPORT_MW = 120.0
-    GRID_MAX_EXPORT_MW = 50.0
-    CHARGE_EFFICIENCY = 0.95
-    DISCHARGE_EFFICIENCY = 0.95
-    MAX_DIESEL_MW = 50.0
-
-    EXPORT_TARIFF_PER_MWH = 50.0
-    DIESEL_COST_PER_MWH = 1000.0
-    BLACKOUT_PENALTY_PER_MWH = 100000.0
-    OVERVOLTAGE_PENALTY_PER_MWH = 5000.0
-    BATTERY_WEAR_PER_MWH = 50.0
-    DEMAND_CHARGE_PER_MW = 1000.0
-    CARBON_PRICE_PER_KG = 50.0
-    DEFAULT_GRID_CO2_KG_PER_MWH = 0.7
-    DIESEL_CO2_KG_PER_MWH = 0.27
-    DUCK_CURVE_RAMP_CHARGE_PER_MW2 = 0.01
-
-    OBJECTIVE_WEIGHTS = {
-        "blackout_penalty": 1.0,
-        "overvoltage_penalty": 1.0,
-        "demand_charge": 1.0,
-        "tariff_import": 1.0,
-        "tariff_export": 1.0,
-        "generator_fuel": 1.0,
-        "battery_wear": 1.0,
-        "carbon_cost": 1.0,
-        "ramp_charge": 1.0,
-        "soc_reserve_penalty": 1.0,
-    }
+    ACTION_COSTS = ActionCosts()
+    OBJECTIVE_WEIGHTS = ObjectiveWeights()
 
     def __init__(self) -> None:
         self.memory = ControllerMemory()
@@ -104,7 +114,7 @@ class Strategy:
         self,
         state: dict[str, Any],
         action: dict[str, float],
-        weights: dict[str, float] | None = None,
+        weights: ObjectiveWeights | None = None,
     ) -> float:
         terms = self.objective_terms(state, action)
         active_weights = self.OBJECTIVE_WEIGHTS if weights is None else weights
@@ -114,7 +124,8 @@ class Strategy:
         self, state: dict[str, Any], action: dict[str, float]
     ) -> dict[str, float]:
         physics = self.estimate_physics(state, action)
-        dt = self.DT_HOURS
+        costs = self.ACTION_COSTS
+        dt = costs.dt_hours
 
         import_mwh = physics["import_mw"] * dt
         export_mwh = physics["export_mw"] * dt
@@ -122,24 +133,24 @@ class Strategy:
         battery_mwh = abs(physics["battery_mw"]) * dt
 
         grid_co2 = float(
-            state.get("grid_co2_intensity", self.DEFAULT_GRID_CO2_KG_PER_MWH)
+            state.get("grid_co2_intensity", costs.default_grid_co2_kg_per_mwh)
         )
-        co2_kg = import_mwh * grid_co2 + diesel_mwh * self.DIESEL_CO2_KG_PER_MWH
+        co2_kg = import_mwh * grid_co2 + diesel_mwh * costs.diesel_co2_kg_per_mwh
 
         terms = {
             "blackout_penalty": (
-                physics["unmet_demand_mw"] * dt * self.BLACKOUT_PENALTY_PER_MWH
+                physics["unmet_demand_mw"] * dt * costs.blackout_penalty_per_mwh
             ),
             "overvoltage_penalty": (
-                physics["overvoltage_mw"] * dt * self.OVERVOLTAGE_PENALTY_PER_MWH
+                physics["overvoltage_mw"] * dt * costs.overvoltage_penalty_per_mwh
             ),
             "demand_charge": physics["new_peak_import_delta_mw"]
-            * self.DEMAND_CHARGE_PER_MW,
+            * costs.demand_charge_per_mw,
             "tariff_import": import_mwh * float(state.get("price", 0.0)),
-            "tariff_export": -export_mwh * self.EXPORT_TARIFF_PER_MWH,
-            "generator_fuel": diesel_mwh * self.DIESEL_COST_PER_MWH,
-            "battery_wear": battery_mwh * self.BATTERY_WEAR_PER_MWH,
-            "carbon_cost": co2_kg * self.CARBON_PRICE_PER_KG,
+            "tariff_export": -export_mwh * costs.export_tariff_per_mwh,
+            "generator_fuel": diesel_mwh * costs.diesel_cost_per_mwh,
+            "battery_wear": battery_mwh * costs.battery_wear_per_mwh,
+            "carbon_cost": co2_kg * costs.carbon_price_per_kg,
             "ramp_charge": self.ramp_charge(state, physics["net_grid_power_mw"]),
             "soc_reserve_penalty": self.soc_reserve_penalty(state, physics),
         }
@@ -151,13 +162,14 @@ class Strategy:
         demand = float(state.get("demand", 0.0))
         solar = float(state.get("solar", 0.0))
         soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
+        costs = self.ACTION_COSTS
 
         requested_battery_mw = float(action.get("battery_flow_mw", 0.0))
         battery_mw = self.feasible_battery_power(requested_battery_mw, soc)
         next_soc = self.next_soc(soc, battery_mw)
 
         diesel_mw = self._clip(
-            float(action.get("emergency_generator", 0.0)), 0.0, self.MAX_DIESEL_MW
+            float(action.get("emergency_generator", 0.0)), 0.0, costs.max_diesel_mw
         )
         curtail_solar_mw = self._clip(
             float(action.get("curtail_solar", 0.0)), 0.0, solar
@@ -166,14 +178,14 @@ class Strategy:
         actual_solar_mw = solar - curtail_solar_mw
         raw_net_grid_power_mw = demand - actual_solar_mw - battery_mw - diesel_mw
 
-        unmet_demand_mw = max(0.0, raw_net_grid_power_mw - self.GRID_MAX_IMPORT_MW)
+        unmet_demand_mw = max(0.0, raw_net_grid_power_mw - costs.grid_max_import_mw)
         overvoltage_mw = max(
-            0.0, -raw_net_grid_power_mw - self.GRID_MAX_EXPORT_MW
+            0.0, -raw_net_grid_power_mw - costs.grid_max_export_mw
         )
         net_grid_power_mw = self._clip(
             raw_net_grid_power_mw,
-            -self.GRID_MAX_EXPORT_MW,
-            self.GRID_MAX_IMPORT_MW,
+            -costs.grid_max_export_mw,
+            costs.grid_max_import_mw,
         )
 
         import_mw = max(0.0, net_grid_power_mw)
@@ -195,32 +207,36 @@ class Strategy:
         }
 
     def feasible_battery_power(self, requested_mw: float, soc: float) -> float:
+        costs = self.ACTION_COSTS
         clipped_mw = self._clip(
-            requested_mw, -self.MAX_INVERTER_MW, self.MAX_INVERTER_MW
+            requested_mw, -costs.max_inverter_mw, costs.max_inverter_mw
         )
 
         if clipped_mw > 0.0:
             max_discharge_mw = (
-                soc * self.BATTERY_CAPACITY_MWH * self.DISCHARGE_EFFICIENCY
-            ) / self.DT_HOURS
+                soc * costs.battery_capacity_mwh * costs.discharge_efficiency
+            ) / costs.dt_hours
             return min(clipped_mw, max_discharge_mw)
 
         if clipped_mw < 0.0:
-            headroom_mwh = (1.0 - soc) * self.BATTERY_CAPACITY_MWH
-            max_charge_mw = headroom_mwh / (self.CHARGE_EFFICIENCY * self.DT_HOURS)
+            headroom_mwh = (1.0 - soc) * costs.battery_capacity_mwh
+            max_charge_mw = headroom_mwh / (
+                costs.charge_efficiency * costs.dt_hours
+            )
             return max(clipped_mw, -max_charge_mw)
 
         return 0.0
 
     def next_soc(self, soc: float, battery_mw: float) -> float:
+        costs = self.ACTION_COSTS
         if battery_mw > 0.0:
-            next_soc = soc - (battery_mw * self.DT_HOURS) / (
-                self.BATTERY_CAPACITY_MWH * self.DISCHARGE_EFFICIENCY
+            next_soc = soc - (battery_mw * costs.dt_hours) / (
+                costs.battery_capacity_mwh * costs.discharge_efficiency
             )
         elif battery_mw < 0.0:
             next_soc = soc - (
-                battery_mw * self.CHARGE_EFFICIENCY * self.DT_HOURS
-            ) / self.BATTERY_CAPACITY_MWH
+                battery_mw * costs.charge_efficiency * costs.dt_hours
+            ) / costs.battery_capacity_mwh
         else:
             next_soc = soc
 
@@ -231,7 +247,11 @@ class Strategy:
         if prev_grid is None:
             return 0.0
         ramp_mw = net_grid_power_mw - float(prev_grid)
-        return ramp_mw * ramp_mw * self.DUCK_CURVE_RAMP_CHARGE_PER_MW2
+        return (
+            ramp_mw
+            * ramp_mw
+            * self.ACTION_COSTS.duck_curve_ramp_charge_per_mw2
+        )
 
     def soc_reserve_penalty(
         self, state: dict[str, Any], physics: dict[str, float]
