@@ -8,6 +8,7 @@ branch depends on a scenario name.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from strategy_task2 import Strategy as ForecastPlanner
@@ -16,10 +17,12 @@ from strategy_task2 import Strategy as ForecastPlanner
 class Strategy(ForecastPlanner):
     DUCK_RESERVE_WEIGHT = 1_500_000.0
     DUCK_RAMP_CHARGE = 0.01
+    RESERVE_PREP_LEAD_STEPS = 20
 
     def __init__(self) -> None:
         super().__init__()
         self.operator_constraints: list[dict[str, float | int | str]] = []
+        self.anomaly_ack: str | None = None
 
     def plan(self, state: dict[str, Any]) -> dict[str, Any]:
         self._observe(state)
@@ -155,8 +158,6 @@ class Strategy(ForecastPlanner):
             )
             if at_step <= t <= end_step:
                 return magnitude
-            if 0 <= at_step - t <= 12:
-                reserve = max(reserve, min(magnitude, 31.0))
         return self._clip(reserve, 0.0, self.ACTION_COSTS.max_inverter_mw)
 
     def _fcas_soc_floor(self, state: dict[str, Any], t: int) -> float:
@@ -224,6 +225,9 @@ class Strategy(ForecastPlanner):
                 "end_step": day_start + 88,
                 "min_soc_floor": 0.80,
             }
+        step_floor = self._step_window_soc_floor(alert, text)
+        if step_floor:
+            return step_floor
         if ("seventy" in text or "70" in text) and "reserve" in text:
             return {
                 "id": str(alert.get("id") or ""),
@@ -245,14 +249,66 @@ class Strategy(ForecastPlanner):
                 "end_step": day_start + 84,
                 "max_export_mw": 25.0,
             }
+        step_export_cap = self._step_window_export_cap(alert, text)
+        if step_export_cap:
+            return step_export_cap
         if "fcas" in text and "40 mw" in text:
             return {
                 "id": str(alert.get("id") or ""),
                 "start_step": day_start + 18,
                 "end_step": day_start + 22,
                 "fcas_reserve_mw": 40.0,
+                "min_soc_floor": 0.75,
             }
         return None
+
+    def _steps_from_text(self, text: str) -> list[int]:
+        range_match = re.search(r"step\s+(\d+)\s+(?:to|until|-)\s+(\d+)", text)
+        if range_match:
+            return [int(range_match.group(1)), int(range_match.group(2))]
+        bracket = re.findall(r"\[(\d+),\s*(\d+)\]", text)
+        if bracket:
+            return [int(value) for value in bracket[0]]
+        return [int(value) for value in re.findall(r"step\s+(\d+)", text)]
+
+    def _step_window_soc_floor(
+        self, alert: dict[str, Any], text: str
+    ) -> dict[str, Any] | None:
+        if "state-of-charge" not in text and "soc" not in text:
+            return None
+        if "step" not in text or not ("%" in text or "percent" in text):
+            return None
+
+        steps = self._steps_from_text(text)
+        floor_match = re.search(r"(\d+)\s*%", text)
+        if floor_match is None:
+            floor_match = re.search(r"(\d+)\s*percent", text)
+        if len(steps) < 2 or floor_match is None:
+            return None
+
+        floor = self._clip(float(floor_match.group(1)) / 100.0, 0.0, 0.95)
+        return {
+            "id": str(alert.get("id") or ""),
+            "start_step": min(steps[0], steps[1]),
+            "end_step": max(steps[0], steps[1]),
+            "min_soc_floor": floor,
+        }
+
+    def _step_window_export_cap(
+        self, alert: dict[str, Any], text: str
+    ) -> dict[str, Any] | None:
+        if "export" not in text or "step" not in text:
+            return None
+        cap_match = re.search(r"(\d+(?:\.\d+)?)\s*mw", text)
+        steps = self._steps_from_text(text)
+        if cap_match is None or len(steps) < 2:
+            return None
+        return {
+            "id": str(alert.get("id") or ""),
+            "start_step": min(steps[0], steps[1]),
+            "end_step": max(steps[0], steps[1]),
+            "max_export_mw": float(cap_match.group(1)),
+        }
 
     def _operator_soc_floor(self, t: int) -> float:
         floor = 0.0
@@ -262,7 +318,7 @@ class Strategy(ForecastPlanner):
                 continue
             start = int(constraint.get("start_step", 0))
             end = int(constraint.get("end_step", start))
-            if start - 24 <= t <= end:
+            if start - self.RESERVE_PREP_LEAD_STEPS <= t <= end:
                 floor = max(floor, float(min_floor))
         return self._clip(floor, 0.0, 0.90)
 
@@ -282,11 +338,11 @@ class Strategy(ForecastPlanner):
         plan: dict[str, Any] = {}
         for alert in state.get("alerts") or []:
             text = self._alert_text(alert)
-            marker = "anomaly"
-            if marker in text:
-                for token in text.replace(":", " ").replace(",", " ").split():
-                    if token.startswith("anom-"):
-                        plan["anomaly_ack"] = token.strip(".;")
+            match = re.search(r"\banom-[a-z0-9_-]+\b", text)
+            if match:
+                self.anomaly_ack = match.group(0)
+        if self.anomaly_ack:
+            plan["anomaly_ack"] = self.anomaly_ack
         return plan
 
     def _alert_text(self, alert: dict[str, Any]) -> str:
