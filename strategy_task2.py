@@ -1,14 +1,21 @@
-"""Task 1 strategy scaffold for the duck_curve scenario.
+"""Task 2 strategy for the frequency_frenzy scenario.
 
-This file defines the controller shape, state-machine plumbing, and local
-objective/cost functions. Dispatch logic can be added once we decide how to
-search candidate actions.
+This keeps the submission shape as a single Strategy class, but uses the main
+lesson from the prior vinh submission: plan SOC over a horizon instead of using
+the duck-curve evening reserve rules. Frequency Frenzy's hard problem is the
+dawn heating spike, so reliability gets first priority.
 """
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 from typing import Any
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - judge may not provide numpy
+    np = None
 
 
 class Mode(str, Enum):
@@ -22,25 +29,9 @@ class ControllerMemory:
         self.last_time: int | None = None
         self.last_soc: float | None = None
         self.last_net_grid_power_mw: float | None = None
-        self.last_objective_terms: dict[str, float] = {}
-        self.last_objective_score: float = 0.0
-
-
-class ObjectiveWeights:
-    def __init__(self) -> None:
-        self.blackout_penalty = 20.0
-        self.overvoltage_penalty = 10.0
-        self.demand_charge = 1.0
-        self.tariff_import = 1.0
-        self.tariff_export = 1.0
-        self.generator_fuel = 1.0
-        self.battery_wear = 1.0
-        self.carbon_cost = 1.0
-        self.ramp_charge = 1.0
-        self.soc_reserve_penalty = 1500000.0
-
-    def get(self, name: str, default: float = 1.0) -> float:
-        return float(getattr(self, name, default))
+        self.last_grid_power_mw: float | None = None
+        self.observed_slots: set[int] = set()
+        self.prior_scaled = False
 
 
 class ActionCosts:
@@ -60,315 +51,368 @@ class ActionCosts:
         self.overvoltage_penalty_per_mwh = 5000.0
         self.battery_wear_per_mwh = 50.0
         self.demand_charge_per_mw = 1000.0
-        self.carbon_price_per_kg = 50.0
+        self.carbon_price_per_kg = 125.0
         self.default_grid_co2_kg_per_mwh = 0.7
         self.diesel_co2_kg_per_mwh = 0.27
-        self.duck_curve_ramp_charge_per_mw2 = 0.01
+        self.ramp_charge_per_mw2 = 0.75
 
 
 class Strategy:
-    """Boilerplate Strategy lifecycle accepted by the playtest runner."""
+    """Forecast-aware SOC planner for Frequency Frenzy."""
 
     ACTION_COSTS = ActionCosts()
-    OBJECTIVE_WEIGHTS = ObjectiveWeights()
+    STEPS_PER_DAY = 96
+    PLAN_HORIZON = 96
+    SOC_GRID_POINTS = 31
 
     def __init__(self) -> None:
         self.memory = ControllerMemory()
+        (
+            self.demand_profile,
+            self.solar_profile,
+            self.price_profile,
+        ) = self._daily_prior()
 
     def plan(self, state: dict[str, Any]) -> dict[str, Any]:
         self._observe(state)
-        return {"agent_plan": {"task": "duck_curve"}}
+        return {"agent_plan": {"task": "frequency_frenzy"}}
 
     def replan(
         self, state: dict[str, Any], alerts: list[dict[str, Any]]
     ) -> dict[str, Any]:
         self._observe(state)
-        return {"agent_plan": {"task": "duck_curve", "alerts_seen": len(alerts)}}
+        return {"agent_plan": {"task": "frequency_frenzy", "alerts_seen": len(alerts)}}
 
     def step(self, state: dict[str, Any]) -> dict[str, float]:
         self._observe(state)
         self.memory.mode = Mode.DISPATCH
-        action = self.choose_action(state)
-        self.memory.last_objective_terms = self.objective_terms(state, action)
-        self.memory.last_objective_score = self.objective_score(state, action)
-        return action
 
-    def _observe(self, state: dict[str, Any]) -> None:
+        t = int(state.get("time", 0))
         demand = float(state.get("demand", 0.0))
         solar = float(state.get("solar", 0.0))
+        soc = self._clip(float(state.get("soc", 0.5)), 0.0, 1.0)
 
-        self.memory.last_time = int(state.get("time", 0))
-        self.memory.last_soc = float(state.get("soc", 0.0))
-        self.memory.last_net_grid_power_mw = demand - solar
+        demand_plan, solar_plan, price_plan = self._build_plan(state, t)
+        target_soc = self._plan_next_soc(
+            soc=soc,
+            demand_plan=demand_plan,
+            solar_plan=solar_plan,
+            price_plan=price_plan,
+            peak_seen=float(state.get("peak_import_mw") or 0.0),
+            grid_co2=float(
+                state.get("grid_co2_intensity")
+                or self.ACTION_COSTS.default_grid_co2_kg_per_mwh
+            ),
+            previous_grid_mw=self.memory.last_grid_power_mw,
+        )
+        target_soc = max(target_soc, self._reserve_soc_floor(state, t))
 
-    @staticmethod
-    def _empty_action() -> dict[str, float]:
+        battery_flow_mw = self._flow_to_target(soc, target_soc)
+        battery_flow_mw = self._clip_battery_flow(battery_flow_mw, soc)
+
+        reliability_flow_mw = self._required_reliability_discharge(demand, solar)
+        if reliability_flow_mw > 0.0:
+            battery_flow_mw = max(battery_flow_mw, reliability_flow_mw)
+        battery_flow_mw = self._clip_battery_flow(battery_flow_mw, soc)
+
+        net_grid_mw = demand - solar - battery_flow_mw
+        curtail_solar_mw = self._clip(
+            max(0.0, -net_grid_mw - self.ACTION_COSTS.grid_max_export_mw),
+            0.0,
+            solar,
+        )
+
+        net_after_curtail_mw = net_grid_mw + curtail_solar_mw
+        diesel_mw = self._clip(
+            max(0.0, net_after_curtail_mw - self.ACTION_COSTS.grid_max_import_mw),
+            0.0,
+            self.ACTION_COSTS.max_diesel_mw,
+        )
+
+        self.memory.last_grid_power_mw = net_after_curtail_mw - diesel_mw
         return {
-            "battery_flow_mw": 0.0,
-            "emergency_generator": 0.0,
-            "curtail_solar": 0.0,
+            "battery_flow_mw": float(battery_flow_mw),
+            "emergency_generator": float(diesel_mw),
+            "curtail_solar": float(curtail_solar_mw),
             "fcas_reserve_mw": 0.0,
         }
 
-    def objective_score(
-        self,
-        state: dict[str, Any],
-        action: dict[str, float],
-        weights: ObjectiveWeights | None = None,
-    ) -> float:
-        terms = self.objective_terms(state, action)
-        active_weights = self.OBJECTIVE_WEIGHTS if weights is None else weights
-        return sum(active_weights.get(name, 1.0) * value for name, value in terms.items())
-
-    def choose_action(self, state: dict[str, Any]) -> dict[str, float]:
-        candidates = self.generate_candidate_actions(state)
-        return min(candidates, key=lambda action: self.objective_score(state, action))
-
-    def generate_candidate_actions(self, state: dict[str, Any]) -> list[dict[str, float]]:
+    def _observe(self, state: dict[str, Any]) -> None:
+        t = int(state.get("time", 0))
         demand = float(state.get("demand", 0.0))
         solar = float(state.get("solar", 0.0))
-        soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
-        costs = self.ACTION_COSTS
-
-        surplus_mw = solar - demand
-        deficit_mw = demand - solar
         price = float(state.get("price", 0.0))
-        pre_action_import_mw = max(0.0, demand - solar)
+        soc = self._clip(float(state.get("soc", 0.5)), 0.0, 1.0)
+        slot = t % self.STEPS_PER_DAY
 
-        battery_options = {0.0}
+        self._scale_prior_once(slot, demand, price)
+        self.demand_profile[slot] = demand
+        self.solar_profile[slot] = solar
+        self.price_profile[slot] = price
+        self.memory.observed_slots.add(slot)
 
-        if surplus_mw > 0.0 and soc < 0.98:
-            battery_options.update(
-                {
-                    -10.0,
-                    -20.0,
-                    -30.0,
-                    -40.0,
-                    -50.0,
-                    -min(costs.max_inverter_mw, surplus_mw),
-                }
-            )
+        self.memory.last_time = t
+        self.memory.last_soc = soc
+        self.memory.last_net_grid_power_mw = demand - solar
 
-        should_discharge = (
-            price >= 430.0
-            or pre_action_import_mw >= costs.grid_max_import_mw - 10.0
-        )
-        if deficit_mw > 0.0 and soc > 0.05 and should_discharge:
-            discharge_cap_mw = self.discharge_cap_for_peak(state, soc)
-            battery_options.update(
-                {
-                    min(discharge_cap_mw, 10.0),
-                    min(discharge_cap_mw, 20.0),
-                    min(discharge_cap_mw, 30.0),
-                    min(discharge_cap_mw, 40.0),
-                    min(discharge_cap_mw, 50.0),
-                    min(discharge_cap_mw, deficit_mw),
-                }
-            )
-
-        candidates: list[dict[str, float]] = []
-        for battery_mw in sorted(battery_options):
-            feasible_battery_mw = self.feasible_battery_power(battery_mw, soc)
-            raw_net_without_diesel = demand - solar - feasible_battery_mw
-            diesel_needed_mw = max(
-                0.0, raw_net_without_diesel - costs.grid_max_import_mw
-            )
-            diesel_options = {0.0}
-            if diesel_needed_mw > 0.0:
-                diesel_options.add(min(costs.max_diesel_mw, diesel_needed_mw))
-
-            for diesel_mw in sorted(diesel_options):
-                raw_net_without_curtail = demand - solar - feasible_battery_mw - diesel_mw
-                curtail_needed_mw = max(
-                    0.0, -raw_net_without_curtail - costs.grid_max_export_mw
-                )
-                curtail_options = {0.0}
-                if curtail_needed_mw > 0.0:
-                    curtail_options.add(min(solar, curtail_needed_mw))
-
-                for curtail_mw in sorted(curtail_options):
-                    candidates.append(
-                        {
-                            "battery_flow_mw": float(battery_mw),
-                            "emergency_generator": float(diesel_mw),
-                            "curtail_solar": float(curtail_mw),
-                            "fcas_reserve_mw": 0.0,
-                        }
-                    )
-
-        return candidates or [self._empty_action()]
-
-    def objective_terms(
-        self, state: dict[str, Any], action: dict[str, float]
-    ) -> dict[str, float]:
-        physics = self.estimate_physics(state, action)
-        costs = self.ACTION_COSTS
-        dt = costs.dt_hours
-
-        import_mwh = physics["import_mw"] * dt
-        export_mwh = physics["export_mw"] * dt
-        diesel_mwh = physics["diesel_mw"] * dt
-        battery_mwh = abs(physics["battery_mw"]) * dt
-
-        grid_co2 = float(
-            state.get("grid_co2_intensity", costs.default_grid_co2_kg_per_mwh)
-        )
-        co2_kg = import_mwh * grid_co2 + diesel_mwh * costs.diesel_co2_kg_per_mwh
-
-        terms = {
-            "blackout_penalty": (
-                physics["unmet_demand_mw"] * dt * costs.blackout_penalty_per_mwh
-            ),
-            "overvoltage_penalty": (
-                physics["overvoltage_mw"] * dt * costs.overvoltage_penalty_per_mwh
-            ),
-            "demand_charge": physics["new_peak_import_delta_mw"]
-            * costs.demand_charge_per_mw,
-            "tariff_import": import_mwh * float(state.get("price", 0.0)),
-            "tariff_export": -export_mwh * costs.export_tariff_per_mwh,
-            "generator_fuel": diesel_mwh * costs.diesel_cost_per_mwh,
-            "battery_wear": battery_mwh * costs.battery_wear_per_mwh,
-            "carbon_cost": co2_kg * costs.carbon_price_per_kg,
-            "ramp_charge": self.ramp_charge(state, physics["net_grid_power_mw"]),
-            "soc_reserve_penalty": self.soc_reserve_penalty(state, physics),
-        }
-        return {name: float(value) for name, value in terms.items()}
-
-    def estimate_physics(
-        self, state: dict[str, Any], action: dict[str, float]
-    ) -> dict[str, float]:
-        demand = float(state.get("demand", 0.0))
-        solar = float(state.get("solar", 0.0))
-        soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
-        costs = self.ACTION_COSTS
-
-        requested_battery_mw = float(action.get("battery_flow_mw", 0.0))
-        battery_mw = self.feasible_battery_power(requested_battery_mw, soc)
-        next_soc = self.next_soc(soc, battery_mw)
-
-        diesel_mw = self._clip(
-            float(action.get("emergency_generator", 0.0)), 0.0, costs.max_diesel_mw
-        )
-        curtail_solar_mw = self._clip(
-            float(action.get("curtail_solar", 0.0)), 0.0, solar
+    def _build_plan(
+        self, state: dict[str, Any], t: int
+    ) -> tuple[list[float], list[float], list[float]]:
+        forecast = state.get("forecast") or {}
+        forecast_demand = list(forecast.get("demand") or [])
+        forecast_solar = list(forecast.get("solar") or [])
+        forecast_price = list(forecast.get("price") or [])
+        forecast_len = min(
+            len(forecast_demand),
+            len(forecast_solar),
+            len(forecast_price),
         )
 
-        actual_solar_mw = solar - curtail_solar_mw
-        raw_net_grid_power_mw = demand - actual_solar_mw - battery_mw - diesel_mw
+        demand_plan: list[float] = []
+        solar_plan: list[float] = []
+        price_plan: list[float] = []
+        for h in range(self.PLAN_HORIZON):
+            if h == 0:
+                demand_plan.append(float(state.get("demand", 0.0)))
+                solar_plan.append(float(state.get("solar", 0.0)))
+                price_plan.append(float(state.get("price", 0.0)))
+            elif h < forecast_len:
+                demand_plan.append(float(forecast_demand[h]))
+                solar_plan.append(float(forecast_solar[h]))
+                price_plan.append(float(forecast_price[h]))
+            else:
+                slot = (t + h) % self.STEPS_PER_DAY
+                demand_plan.append(self.demand_profile[slot])
+                solar_plan.append(self.solar_profile[slot])
+                price_plan.append(self.price_profile[slot])
 
-        unmet_demand_mw = max(0.0, raw_net_grid_power_mw - costs.grid_max_import_mw)
-        overvoltage_mw = max(
-            0.0, -raw_net_grid_power_mw - costs.grid_max_export_mw
-        )
-        net_grid_power_mw = self._clip(
-            raw_net_grid_power_mw,
-            -costs.grid_max_export_mw,
-            costs.grid_max_import_mw,
-        )
+        return demand_plan, solar_plan, price_plan
 
-        import_mw = max(0.0, net_grid_power_mw)
-        export_mw = max(0.0, -net_grid_power_mw)
-        peak_import_mw = float(state.get("peak_import_mw", 0.0))
+    def _reserve_soc_floor(self, state: dict[str, Any], t: int) -> float:
+        scenario_id = str(state.get("scenario_id") or "")
+        if scenario_id == "frequency_frenzy" and t < 18:
+            return 0.50
 
-        return {
-            "battery_mw": battery_mw,
-            "diesel_mw": diesel_mw,
-            "curtail_solar_mw": curtail_solar_mw,
-            "next_soc": next_soc,
-            "raw_net_grid_power_mw": raw_net_grid_power_mw,
-            "net_grid_power_mw": net_grid_power_mw,
-            "import_mw": import_mw,
-            "export_mw": export_mw,
-            "unmet_demand_mw": unmet_demand_mw,
-            "overvoltage_mw": overvoltage_mw,
-            "new_peak_import_delta_mw": max(0.0, import_mw - peak_import_mw),
-        }
-
-    def feasible_battery_power(self, requested_mw: float, soc: float) -> float:
-        costs = self.ACTION_COSTS
-        clipped_mw = self._clip(
-            requested_mw, -costs.max_inverter_mw, costs.max_inverter_mw
-        )
-
-        if clipped_mw > 0.0:
-            max_discharge_mw = (
-                soc * costs.battery_capacity_mwh * costs.discharge_efficiency
-            ) / costs.dt_hours
-            return min(clipped_mw, max_discharge_mw)
-
-        if clipped_mw < 0.0:
-            headroom_mwh = (1.0 - soc) * costs.battery_capacity_mwh
-            max_charge_mw = headroom_mwh / (
-                costs.charge_efficiency * costs.dt_hours
-            )
-            return max(clipped_mw, -max_charge_mw)
+        alerts = state.get("alerts") or []
+        if t < 18 and any(alert.get("id") == "dawn_demand_bias" for alert in alerts):
+            return 0.50
 
         return 0.0
 
-    def next_soc(self, soc: float, battery_mw: float) -> float:
-        costs = self.ACTION_COSTS
-        if battery_mw > 0.0:
-            next_soc = soc - (battery_mw * costs.dt_hours) / (
-                costs.battery_capacity_mwh * costs.discharge_efficiency
-            )
-        elif battery_mw < 0.0:
-            next_soc = soc - (
-                battery_mw * costs.charge_efficiency * costs.dt_hours
-            ) / costs.battery_capacity_mwh
-        else:
-            next_soc = soc
-
-        return self._clip(next_soc, 0.0, 1.0)
-
-    def ramp_charge(self, state: dict[str, Any], net_grid_power_mw: float) -> float:
-        prev_grid = state.get("prev_grid_power_mw")
-        if prev_grid is None:
-            return 0.0
-        ramp_mw = net_grid_power_mw - float(prev_grid)
-        return (
-            ramp_mw
-            * ramp_mw
-            * self.ACTION_COSTS.duck_curve_ramp_charge_per_mw2
+    def _required_reliability_discharge(self, demand: float, solar: float) -> float:
+        return max(
+            0.0,
+            demand
+            - solar
+            - self.ACTION_COSTS.grid_max_import_mw
+            - self.ACTION_COSTS.max_diesel_mw,
         )
 
-    def soc_reserve_penalty(
-        self, state: dict[str, Any], physics: dict[str, float]
+    def _plan_next_soc(
+        self,
+        *,
+        soc: float,
+        demand_plan: list[float],
+        solar_plan: list[float],
+        price_plan: list[float],
+        peak_seen: float,
+        grid_co2: float,
+        previous_grid_mw: float | None = None,
     ) -> float:
-        target = self.desired_soc_floor(state)
-        shortfall = max(0.0, target - physics["next_soc"])
-        return shortfall * shortfall
+        if np is None:
+            return self._fallback_target_soc(
+                soc=soc,
+                demand_plan=demand_plan,
+                solar_plan=solar_plan,
+                price_plan=price_plan,
+                peak_seen=peak_seen,
+            )
 
-    def desired_soc_floor(self, state: dict[str, Any]) -> float:
-        time_of_day = int(state.get("time", 0)) % 96
-        day = int(state.get("time", 0)) // 96
-        solar = float(state.get("solar", 0.0))
-        demand = float(state.get("demand", 0.0))
-
-        if 40 <= time_of_day <= 62 and solar > demand:
-            return 1.00
-        if 63 <= time_of_day <= 66:
-            return 0.45
-        if 67 <= time_of_day <= 76:
-            return 0.20
-        if 77 <= time_of_day <= 86:
-            return 0.05
-        return 0.05
-
-    @staticmethod
-    def is_peak_window(state: dict[str, Any]) -> bool:
-        time_of_day = int(state.get("time", 0)) % 96
-        return 64 <= time_of_day <= 86
-
-    def discharge_cap_for_peak(self, state: dict[str, Any], soc: float) -> float:
         costs = self.ACTION_COSTS
-        if not self.is_peak_window(state):
-            return costs.max_inverter_mw
+        levels = np.linspace(0.0, 1.0, self.SOC_GRID_POINTS)
+        n = len(levels)
+        horizon = len(demand_plan)
 
-        time_of_day = int(state.get("time", 0)) % 96
-        remaining_steps = max(1, 83 - time_of_day)
-        deliverable_mwh = soc * costs.battery_capacity_mwh * costs.discharge_efficiency
-        sustainable_mw = deliverable_mwh / (remaining_steps * costs.dt_hours)
-        return self._clip(1.6 * sustainable_mw, 10.0, costs.max_inverter_mw)
+        soc_i = levels[:, None]
+        soc_j = levels[None, :]
+        flows = np.zeros((n, n))
+
+        charge_mask = soc_j > soc_i
+        flows[charge_mask] = -(
+            (soc_j - soc_i)[charge_mask] * costs.battery_capacity_mwh
+        ) / (costs.charge_efficiency * costs.dt_hours)
+
+        discharge_mask = soc_j < soc_i
+        flows[discharge_mask] = (
+            (soc_i - soc_j)[discharge_mask]
+            * costs.battery_capacity_mwh
+            * costs.discharge_efficiency
+        ) / costs.dt_hours
+
+        valid_flow = (
+            (flows >= -costs.max_inverter_mw)
+            & (flows <= costs.max_inverter_mw)
+        )
+        battery_wear = (
+            np.abs(flows) * costs.dt_hours * costs.battery_wear_per_mwh
+        )
+
+        value = np.zeros((horizon + 1, n))
+        policy = np.zeros((horizon, n), dtype=int)
+        planning_peak = max(peak_seen, 0.0)
+
+        for h in range(horizon - 1, -1, -1):
+            demand = demand_plan[h]
+            solar = solar_plan[h]
+            price = price_plan[h]
+
+            raw_grid = demand - solar - flows
+            diesel = np.minimum(
+                np.maximum(0.0, raw_grid - costs.grid_max_import_mw),
+                costs.max_diesel_mw,
+            )
+            grid_after_diesel = raw_grid - diesel
+            curtail = np.minimum(
+                solar,
+                np.maximum(0.0, -costs.grid_max_export_mw - grid_after_diesel),
+            )
+            net_grid = grid_after_diesel + curtail
+
+            import_mwh = np.maximum(0.0, net_grid * costs.dt_hours)
+            export_mwh = np.minimum(0.0, net_grid * costs.dt_hours)
+            diesel_mwh = diesel * costs.dt_hours
+
+            tariff = (
+                import_mwh * price
+                + export_mwh * costs.export_tariff_per_mwh
+            )
+            diesel_cost = diesel_mwh * costs.diesel_cost_per_mwh
+            carbon_cost = (
+                import_mwh * grid_co2
+                + diesel_mwh * costs.diesel_co2_kg_per_mwh
+            ) * costs.carbon_price_per_kg
+
+            demand_charge_rate = costs.demand_charge_per_mw
+            if h > 0:
+                demand_charge_rate *= 0.25
+            demand_charge = (
+                np.maximum(0.0, net_grid - planning_peak) * demand_charge_rate
+            )
+
+            ramp_charge = 0.0
+            if h == 0 and previous_grid_mw is not None:
+                ramp_charge = (
+                    (net_grid - previous_grid_mw) ** 2
+                ) * costs.ramp_charge_per_mw2
+
+            cost = (
+                tariff
+                + diesel_cost
+                + carbon_cost
+                + battery_wear
+                + demand_charge
+                + ramp_charge
+            )
+            cost[~valid_flow] = np.inf
+
+            total = cost + value[h + 1][None, :]
+            value[h] = np.min(total, axis=1)
+            policy[h] = np.argmin(total, axis=1)
+
+        current_idx = int(np.argmin(np.abs(levels - soc)))
+        next_idx = int(policy[0, current_idx])
+        return float(levels[next_idx])
+
+    def _fallback_target_soc(
+        self,
+        *,
+        soc: float,
+        demand_plan: list[float],
+        solar_plan: list[float],
+        price_plan: list[float],
+        peak_seen: float,
+    ) -> float:
+        net_now = demand_plan[0] - solar_plan[0]
+        price_now = price_plan[0]
+        future_nets = [d - s for d, s in zip(demand_plan[:24], solar_plan[:24])]
+        future_prices = price_plan[:24]
+
+        high_net_soon = max(future_nets) if future_nets else net_now
+        high_price = max(future_prices) if future_prices else price_now
+
+        if -net_now > 5.0:
+            return 0.95
+        if (
+            net_now > 0.0
+            and (price_now >= 0.75 * high_price or net_now >= 0.75 * high_net_soon)
+        ):
+            return 0.08
+        if high_net_soon > max(peak_seen, 80.0):
+            return max(soc, 0.65)
+        return self._clip(soc, 0.25, 0.80)
+
+    def _flow_to_target(self, soc: float, target_soc: float) -> float:
+        costs = self.ACTION_COSTS
+        if target_soc > soc:
+            return -((target_soc - soc) * costs.battery_capacity_mwh) / (
+                costs.charge_efficiency * costs.dt_hours
+            )
+        if target_soc < soc:
+            return (
+                (soc - target_soc)
+                * costs.battery_capacity_mwh
+                * costs.discharge_efficiency
+            ) / costs.dt_hours
+        return 0.0
+
+    def _clip_battery_flow(self, flow: float, soc: float) -> float:
+        costs = self.ACTION_COSTS
+        flow = self._clip(float(flow), -costs.max_inverter_mw, costs.max_inverter_mw)
+        if flow > 0.0:
+            max_discharge = (
+                soc * costs.battery_capacity_mwh * costs.discharge_efficiency
+            ) / costs.dt_hours
+            return min(flow, max_discharge)
+        if flow < 0.0:
+            max_charge = ((1.0 - soc) * costs.battery_capacity_mwh) / (
+                costs.charge_efficiency * costs.dt_hours
+            )
+            return max(flow, -max_charge)
+        return 0.0
+
+    def _daily_prior(self) -> tuple[list[float], list[float], list[float]]:
+        demand: list[float] = []
+        solar: list[float] = []
+        price: list[float] = []
+        for slot in range(self.STEPS_PER_DAY):
+            phase = slot / self.STEPS_PER_DAY
+
+            morning = math.exp(-((phase - 0.33) / 0.09) ** 2)
+            evening = math.exp(-((phase - 0.79) / 0.10) ** 2)
+            demand.append(35.0 + 15.0 * morning + 75.0 * evening)
+
+            if 0.25 < phase < 0.75:
+                solar_phase = (phase - 0.25) / 0.50
+                solar.append(120.0 * math.sin(math.pi * solar_phase))
+            else:
+                solar.append(0.0)
+
+            midday = math.exp(-((phase - 0.50) / 0.14) ** 2)
+            price.append(100.0 + 400.0 * evening - 80.0 * midday)
+
+        return demand, solar, price
+
+    def _scale_prior_once(self, slot: int, demand: float, price: float) -> None:
+        if self.memory.prior_scaled:
+            return
+
+        demand_base = max(1.0, self.demand_profile[slot])
+        price_base = max(1.0, self.price_profile[slot])
+        demand_scale = self._clip(demand / demand_base, 0.75, 1.35)
+        price_scale = self._clip(price / price_base, 0.50, 2.00)
+        self.demand_profile = [value * demand_scale for value in self.demand_profile]
+        self.price_profile = [value * price_scale for value in self.price_profile]
+        self.memory.prior_scaled = True
 
     @staticmethod
     def _clip(value: float, low: float, high: float) -> float:
@@ -378,5 +422,5 @@ class Strategy:
 if __name__ == "__main__":
     from watt_the_hack.playtest import run_playtest
 
-    result = run_playtest(__file__, "duck_curve", plots=True, open_report=False)
+    result = run_playtest(__file__, "frequency_frenzy", plots=True, open_report=False)
     print(f"\nRaw cost (lower wins): ${result['metrics']['final_score']:,.2f}")
