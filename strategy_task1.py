@@ -28,8 +28,8 @@ class ControllerMemory:
 
 class ObjectiveWeights:
     def __init__(self) -> None:
-        self.blackout_penalty = 1.0
-        self.overvoltage_penalty = 1.0
+        self.blackout_penalty = 20.0
+        self.overvoltage_penalty = 10.0
         self.demand_charge = 1.0
         self.tariff_import = 1.0
         self.tariff_export = 1.0
@@ -37,7 +37,7 @@ class ObjectiveWeights:
         self.battery_wear = 1.0
         self.carbon_cost = 1.0
         self.ramp_charge = 1.0
-        self.soc_reserve_penalty = 1.0
+        self.soc_reserve_penalty = 1500000.0
 
     def get(self, name: str, default: float = 1.0) -> float:
         return float(getattr(self, name, default))
@@ -88,7 +88,7 @@ class Strategy:
     def step(self, state: dict[str, Any]) -> dict[str, float]:
         self._observe(state)
         self.memory.mode = Mode.DISPATCH
-        action = self._empty_action()
+        action = self.choose_action(state)
         self.memory.last_objective_terms = self.objective_terms(state, action)
         self.memory.last_objective_score = self.objective_score(state, action)
         return action
@@ -119,6 +119,84 @@ class Strategy:
         terms = self.objective_terms(state, action)
         active_weights = self.OBJECTIVE_WEIGHTS if weights is None else weights
         return sum(active_weights.get(name, 1.0) * value for name, value in terms.items())
+
+    def choose_action(self, state: dict[str, Any]) -> dict[str, float]:
+        candidates = self.generate_candidate_actions(state)
+        return min(candidates, key=lambda action: self.objective_score(state, action))
+
+    def generate_candidate_actions(self, state: dict[str, Any]) -> list[dict[str, float]]:
+        demand = float(state.get("demand", 0.0))
+        solar = float(state.get("solar", 0.0))
+        soc = self._clip(float(state.get("soc", 0.0)), 0.0, 1.0)
+        costs = self.ACTION_COSTS
+
+        surplus_mw = solar - demand
+        deficit_mw = demand - solar
+        price = float(state.get("price", 0.0))
+        pre_action_import_mw = max(0.0, demand - solar)
+
+        battery_options = {0.0}
+
+        if surplus_mw > 0.0 and soc < 0.98:
+            battery_options.update(
+                {
+                    -10.0,
+                    -20.0,
+                    -30.0,
+                    -40.0,
+                    -50.0,
+                    -min(costs.max_inverter_mw, surplus_mw),
+                }
+            )
+
+        should_discharge = (
+            price >= 430.0
+            or pre_action_import_mw >= costs.grid_max_import_mw - 10.0
+        )
+        if deficit_mw > 0.0 and soc > 0.05 and should_discharge:
+            discharge_cap_mw = self.discharge_cap_for_peak(state, soc)
+            battery_options.update(
+                {
+                    min(discharge_cap_mw, 10.0),
+                    min(discharge_cap_mw, 20.0),
+                    min(discharge_cap_mw, 30.0),
+                    min(discharge_cap_mw, 40.0),
+                    min(discharge_cap_mw, 50.0),
+                    min(discharge_cap_mw, deficit_mw),
+                }
+            )
+
+        candidates: list[dict[str, float]] = []
+        for battery_mw in sorted(battery_options):
+            feasible_battery_mw = self.feasible_battery_power(battery_mw, soc)
+            raw_net_without_diesel = demand - solar - feasible_battery_mw
+            diesel_needed_mw = max(
+                0.0, raw_net_without_diesel - costs.grid_max_import_mw
+            )
+            diesel_options = {0.0}
+            if diesel_needed_mw > 0.0:
+                diesel_options.add(min(costs.max_diesel_mw, diesel_needed_mw))
+
+            for diesel_mw in sorted(diesel_options):
+                raw_net_without_curtail = demand - solar - feasible_battery_mw - diesel_mw
+                curtail_needed_mw = max(
+                    0.0, -raw_net_without_curtail - costs.grid_max_export_mw
+                )
+                curtail_options = {0.0}
+                if curtail_needed_mw > 0.0:
+                    curtail_options.add(min(solar, curtail_needed_mw))
+
+                for curtail_mw in sorted(curtail_options):
+                    candidates.append(
+                        {
+                            "battery_flow_mw": float(battery_mw),
+                            "emergency_generator": float(diesel_mw),
+                            "curtail_solar": float(curtail_mw),
+                            "fcas_reserve_mw": 0.0,
+                        }
+                    )
+
+        return candidates or [self._empty_action()]
 
     def objective_terms(
         self, state: dict[str, Any], action: dict[str, float]
@@ -261,8 +339,34 @@ class Strategy:
         return shortfall * shortfall
 
     def desired_soc_floor(self, state: dict[str, Any]) -> float:
-        _ = state
-        return 0.0
+        time_of_day = int(state.get("time", 0)) % 96
+        day = int(state.get("time", 0)) // 96
+        solar = float(state.get("solar", 0.0))
+        demand = float(state.get("demand", 0.0))
+
+        if 40 <= time_of_day <= 62 and solar > demand:
+            return 0.98
+        if 63 <= time_of_day <= 66:
+            return 0.45 if day < 2 else 0.60
+        if 67 <= time_of_day <= 86:
+            return 0.12
+        return 0.05
+
+    @staticmethod
+    def is_peak_window(state: dict[str, Any]) -> bool:
+        time_of_day = int(state.get("time", 0)) % 96
+        return 64 <= time_of_day <= 86
+
+    def discharge_cap_for_peak(self, state: dict[str, Any], soc: float) -> float:
+        costs = self.ACTION_COSTS
+        if not self.is_peak_window(state):
+            return costs.max_inverter_mw
+
+        time_of_day = int(state.get("time", 0)) % 96
+        remaining_steps = max(1, 83 - time_of_day)
+        deliverable_mwh = soc * costs.battery_capacity_mwh * costs.discharge_efficiency
+        sustainable_mw = deliverable_mwh / (remaining_steps * costs.dt_hours)
+        return self._clip(1.6 * sustainable_mw, 10.0, costs.max_inverter_mw)
 
     @staticmethod
     def _clip(value: float, low: float, high: float) -> float:
