@@ -347,9 +347,9 @@ class Strategy:
         if 40 <= time_of_day <= 62 and solar > demand:
             return 0.98
         if 63 <= time_of_day <= 66:
-            return 0.45 if day < 2 else 0.60
+            return 0.45
         if 67 <= time_of_day <= 86:
-            return 0.12
+            return 0.08
         return 0.05
 
     @staticmethod
