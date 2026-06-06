@@ -1,0 +1,28 @@
+{
+  "scenario_id": "duck_curve",
+  "scenario_title": "The Duck Curve",
+  "scenario_mechanics": [
+    [
+      "battery",
+      true
+    ],
+    [
+      "curtailment",
+      true
+    ],
+    [
+      "emergency_generator",
+      true
+    ],
+    [
+      "fcas",
+      false
+    ]
+  ],
+  "controller_path": "C:\\Projects\\MLAI\\wattthehack-f1-City-of-Melbourne-Watt-the-Hack-Advanced-Track\\watt_the_hack\\strategy.py",
+  "controller_kind": "callable",
+  "total_steps": 288,
+  "wall_seconds": 0.078,
+  "engine_version": "0.1.0",
+  "timestamp_utc": "2026-06-06T05:46:04.399320+00:00"
+}
