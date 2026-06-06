@@ -997,7 +997,27 @@
       "stability_abs": 8143.0,
       "unmet": 5.0,
       "renewable": 0.3348,
-      "naive_cost": 975594.5999999994
+      "naive_cost": 975594.5999999994,
+      "optimal_cost": 852112.0737802947
+    },
+    "baseline_breakdown": {
+      "tariff_import": 813229.25,
+      "tariff_export": -40137.5,
+      "generator_fuel": 0.0,
+      "blackout_penalty": 0.0,
+      "overvoltage_penalty": 973750.0,
+      "battery_wear": 0.0,
+      "demand_charge": 120000.0,
+      "carbon_cost": 92277.5,
+      "ramp_charge": 8143.0,
+      "fcas_revenue": 0.0,
+      "fcas_ramp_charge": 0.0,
+      "compliance_penalty": 0.0,
+      "ids_cost": 0.0,
+      "diesel_ban_penalty": 0.0,
+      "fcas_dispatch_bonus": 0.0,
+      "fcas_shortfall_penalty": 0.0,
+      "phishing_fine": 0.0
     }
   }
 }
