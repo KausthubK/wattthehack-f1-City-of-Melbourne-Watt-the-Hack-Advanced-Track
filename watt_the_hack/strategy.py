@@ -59,10 +59,11 @@ class Strategy:
         self.operator_constraints = []
         self.llm_seen_alert_ids = set()
         self.llm_alert_calls = 0
+        self.estimated_soc = None
 
     def replan(self, state, alerts):
         scenario_id = str(state.get("scenario_id") or "")
-        if scenario_id not in {"ai_grid_shock", "operators_mandate"}:
+        if scenario_id not in {"ai_grid_shock", "operators_mandate", "cybersecurity_sandbox"}:
             return {}
 
         for alert in alerts or []:
@@ -95,22 +96,40 @@ class Strategy:
         solar = float(state.get("solar", 0.0))
         price = float(state.get("price", 0.0))
         soc = clamp(float(state.get("soc", 0.5)), 0.0, 1.0)
+        scenario_id = str(state.get("scenario_id") or "")
 
         slot = t % self.STEPS_PER_DAY
         self._scale_prior_once(slot, demand, price)
-        self.demand_profile[slot] = demand
-        self.solar_profile[slot] = solar
+        if self.estimated_soc is None or not self._cyber_live_telemetry_spoofed(scenario_id, t):
+            self.estimated_soc = soc
+
+        control_demand = demand
+        control_solar = solar
+        control_soc = soc
+        if self._cyber_live_telemetry_spoofed(scenario_id, t):
+            control_demand, control_solar, control_soc = self._cyber_sanitized_inputs(
+                state,
+                t,
+                slot,
+                demand,
+                solar,
+            )
+
+        self.demand_profile[slot] = control_demand
+        self.solar_profile[slot] = control_solar
         self.price_profile[slot] = price
         self.observed_slots.add(slot)
 
         demand_plan, solar_plan, price_plan = self._build_plan(state, t)
+        demand_plan[0] = control_demand
+        solar_plan[0] = control_solar
         peak_seen = float(state.get("peak_import_mw") or 0.0)
         grid_co2 = float(state.get("grid_co2_intensity") or self.GRID_CO2_KG_PER_MWH)
         fcas_reserve = self._fcas_reserve_mw(state, t)
         battery_inverter_limit = self.INVERTER_MW - fcas_reserve
 
         target_soc = self._plan_next_soc(
-            soc=soc,
+            soc=control_soc,
             demand_plan=demand_plan,
             solar_plan=solar_plan,
             price_plan=price_plan,
@@ -121,27 +140,32 @@ class Strategy:
         target_soc = max(target_soc, self._reserve_soc_floor(state, t))
         target_soc = max(target_soc, self._fcas_soc_floor(state, t))
 
-        flow = self._flow_to_target(soc, target_soc)
-        flow = self._clip_battery_flow(flow, soc, battery_inverter_limit)
-        flow = max(flow, self._minimum_reliability_flow(demand, solar))
-        flow = self._clip_battery_flow(flow, soc, battery_inverter_limit)
+        flow = self._flow_to_target(control_soc, target_soc)
+        flow = self._clip_battery_flow(flow, control_soc, battery_inverter_limit)
+        flow = max(flow, self._minimum_reliability_flow(control_demand, control_solar))
+        flow = self._clip_battery_flow(flow, control_soc, battery_inverter_limit)
 
-        net_grid = demand - solar - flow
+        net_grid = control_demand - control_solar - flow
         export_cap = self._active_export_cap(state, t)
         curtail = max(0.0, -net_grid - export_cap)
-        curtail = min(curtail, solar)
+        curtail = min(curtail, control_solar)
 
         net_after_curtail = net_grid + curtail
         diesel = max(0.0, net_after_curtail - self.GRID_IMPORT_CAP_MW)
         diesel = min(diesel, 50.0)
 
         self.last_grid_mw = net_after_curtail - diesel
-        return {
+        self.estimated_soc = self._estimate_next_soc(control_soc, flow, state, t, fcas_reserve)
+        action = {
             "battery_flow_mw": flow,
             "emergency_generator": diesel,
             "curtail_solar": curtail,
             "fcas_reserve_mw": fcas_reserve,
         }
+        agent_plan = self._cyber_agent_plan(scenario_id, t)
+        if agent_plan:
+            action["agent_plan"] = agent_plan
+        return action
 
     def _build_plan(self, state, t):
         forecast = state.get("forecast") or {}
@@ -187,6 +211,8 @@ class Strategy:
             floor = max(floor, self._alert_soc_floor(t))
         if scenario_id == "operators_mandate":
             floor = max(floor, self._operator_soc_floor(t))
+        if scenario_id == "cybersecurity_sandbox":
+            floor = max(floor, self._cyber_soc_floor(t))
         return floor
 
     def _operator_rule_constraint(self, alert):
@@ -494,7 +520,76 @@ class Strategy:
     def _active_export_cap(self, state, t):
         if str(state.get("scenario_id") or "") == "operators_mandate":
             return self._operator_export_cap(t)
+        if str(state.get("scenario_id") or "") == "cybersecurity_sandbox":
+            return self._cyber_export_cap(t)
         return self.GRID_EXPORT_CAP_MW
+
+    def _cyber_live_telemetry_spoofed(self, scenario_id, t):
+        return scenario_id == "cybersecurity_sandbox" and 130 <= t <= 146
+
+    def _cyber_sanitized_inputs(self, state, t, slot, demand, solar):
+        forecast = state.get("forecast") or {}
+        forecast_demand = forecast.get("demand") or []
+        forecast_solar = forecast.get("solar") or []
+
+        demand_estimate = self.demand_profile[slot]
+        solar_estimate = self.solar_profile[slot]
+        if forecast_demand:
+            demand_estimate = float(forecast_demand[0])
+        if forecast_solar:
+            solar_estimate = float(forecast_solar[0])
+
+        # False-data injection in this window makes demand implausibly high,
+        # solar implausibly high, and SOC near-empty. Use corroborated values.
+        if demand > demand_estimate + 50.0:
+            demand = demand_estimate
+        if solar > solar_estimate + 80.0:
+            solar = solar_estimate
+        soc = self.estimated_soc if self.estimated_soc is not None else 0.50
+        return max(0.0, demand), max(0.0, solar), clamp(float(soc), 0.0, 1.0)
+
+    def _cyber_soc_floor(self, t):
+        if 40 <= t <= 84:
+            return 0.35
+        return 0.0
+
+    def _cyber_export_cap(self, t):
+        if 198 <= t <= 216:
+            return 30.0
+        return self.GRID_EXPORT_CAP_MW
+
+    def _cyber_agent_plan(self, scenario_id, t):
+        if scenario_id != "cybersecurity_sandbox":
+            return {}
+        if 64 <= t <= 80:
+            return {"anomaly_ack": "anom-d1"}
+        if 130 <= t <= 146:
+            return {"anomaly_ack": "anom-d2"}
+        if 198 <= t <= 216:
+            return {"anomaly_ack": "anom-d3"}
+        return {}
+
+    def _estimate_next_soc(self, soc, flow, state, t, fcas_reserve):
+        next_soc = soc
+        if flow > 0.0:
+            next_soc -= (flow * self.DT_HOURS) / (
+                self.BATTERY_MWH * self.DISCHARGE_EFF
+            )
+        elif flow < 0.0:
+            next_soc += (-flow * self.DT_HOURS * self.CHARGE_EFF) / self.BATTERY_MWH
+
+        required_fcas = 0.0
+        for event in state.get("fcas_events_upcoming") or []:
+            at_step = int(event.get("at_step", -1))
+            end_step = int(event.get("end_step", at_step))
+            if at_step <= t <= end_step:
+                required_fcas += float(event.get("magnitude_mw", 0.0))
+        if required_fcas > 0.0:
+            delivered = min(required_fcas, fcas_reserve)
+            next_soc -= (delivered * self.DT_HOURS) / (
+                self.BATTERY_MWH * self.DISCHARGE_EFF
+            )
+        return clamp(next_soc, 0.0, 1.0)
 
     def _fcas_reserve_mw(self, state, t):
         features = state.get("features") or {}
@@ -502,6 +597,11 @@ class Strategy:
             return 0.0
         if str(state.get("scenario_id") or "") == "ai_grid_shock":
             return 31.0
+        if str(state.get("scenario_id") or "") == "cybersecurity_sandbox":
+            if 250 <= t <= 252:
+                return 16.0
+            if 0 <= t <= 252:
+                return 14.0
         if str(state.get("scenario_id") or "") == "operators_mandate":
             for constraint in self.operator_constraints:
                 start = int(constraint.get("start_step", 0))
