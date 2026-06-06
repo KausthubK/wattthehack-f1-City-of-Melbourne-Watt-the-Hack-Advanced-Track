@@ -249,14 +249,6 @@ class Strategy:
         return max(low, min(high, value))
 
 
-_DEFAULT_STRATEGY = Strategy()
-
-
-def controller(state: dict[str, Any]) -> dict[str, float]:
-    """Function-style entry point for tools that do not use Strategy classes."""
-    return _DEFAULT_STRATEGY.step(state)
-
-
 if __name__ == "__main__":
     from watt_the_hack.playtest import run_playtest
 
