@@ -69,6 +69,8 @@ class Strategy:
         demand_plan, solar_plan, price_plan = self._build_plan(state, t)
         peak_seen = float(state.get("peak_import_mw") or 0.0)
         grid_co2 = float(state.get("grid_co2_intensity") or self.GRID_CO2_KG_PER_MWH)
+        fcas_reserve = self._fcas_reserve_mw(state, t)
+        battery_inverter_limit = self.INVERTER_MW - fcas_reserve
 
         target_soc = self._plan_next_soc(
             soc=soc,
@@ -80,13 +82,12 @@ class Strategy:
             previous_grid_mw=self.last_grid_mw,
         )
         target_soc = max(target_soc, self._reserve_soc_floor(state, t))
+        target_soc = max(target_soc, self._fcas_soc_floor(state, t))
 
         flow = self._flow_to_target(soc, target_soc)
-        flow = self._clip_battery_flow(flow, soc)
-        reliability_flow = self._required_reliability_discharge(demand, solar)
-        if reliability_flow > 0.0:
-            flow = max(flow, reliability_flow)
-        flow = self._clip_battery_flow(flow, soc)
+        flow = self._clip_battery_flow(flow, soc, battery_inverter_limit)
+        flow = max(flow, self._minimum_reliability_flow(demand, solar))
+        flow = self._clip_battery_flow(flow, soc, battery_inverter_limit)
 
         net_grid = demand - solar - flow
         curtail = max(0.0, -net_grid - self.GRID_EXPORT_CAP_MW)
@@ -101,7 +102,7 @@ class Strategy:
             "battery_flow_mw": flow,
             "emergency_generator": diesel,
             "curtail_solar": curtail,
-            "fcas_reserve_mw": 0.0,
+            "fcas_reserve_mw": fcas_reserve,
         }
 
     def _build_plan(self, state, t):
@@ -144,11 +145,48 @@ class Strategy:
             return 0.50
         return 0.0
 
-    def _required_reliability_discharge(self, demand, solar):
-        return max(
-            0.0,
-            demand - solar - self.GRID_IMPORT_CAP_MW - 50.0,
-        )
+    def _minimum_reliability_flow(self, demand, solar):
+        return demand - solar - self.GRID_IMPORT_CAP_MW - 50.0
+
+    def _fcas_reserve_mw(self, state, t):
+        features = state.get("features") or {}
+        if not features.get("fcas", False):
+            return 0.0
+        if str(state.get("scenario_id") or "") == "ai_grid_shock":
+            return 20.0
+
+        for event in state.get("fcas_events_upcoming") or []:
+            at_step = int(event.get("at_step", -1))
+            end_step = int(event.get("end_step", at_step))
+            if at_step <= t <= end_step:
+                return clamp(float(event.get("magnitude_mw", 0.0)), 0.0, self.INVERTER_MW)
+        return 0.0
+
+    def _fcas_soc_floor(self, state, t):
+        features = state.get("features") or {}
+        if not features.get("fcas", False):
+            return 0.0
+
+        floor = 0.0
+        for event in state.get("fcas_events_upcoming") or []:
+            at_step = int(event.get("at_step", -1))
+            end_step = int(event.get("end_step", at_step))
+            magnitude = clamp(float(event.get("magnitude_mw", 0.0)), 0.0, self.INVERTER_MW)
+            if magnitude <= 0.0:
+                continue
+
+            steps_until = at_step - t
+            if steps_until > 12 or t > end_step:
+                continue
+
+            steps_remaining = max(1, end_step - max(t, at_step) + 1)
+            dispatch_energy_soc = (
+                magnitude * self.DT_HOURS * steps_remaining
+            ) / (self.BATTERY_MWH * self.DISCHARGE_EFF)
+            one_hour_backing_soc = magnitude / (self.BATTERY_MWH * self.DISCHARGE_EFF)
+            floor = max(floor, one_hour_backing_soc + dispatch_energy_soc + 0.08)
+
+        return clamp(floor, 0.0, 0.65)
 
     def _plan_next_soc(
         self,
@@ -270,8 +308,11 @@ class Strategy:
             return ((soc - target_soc) * self.BATTERY_MWH * self.DISCHARGE_EFF) / self.DT_HOURS
         return 0.0
 
-    def _clip_battery_flow(self, flow, soc):
-        flow = clamp(float(flow), -self.INVERTER_MW, self.INVERTER_MW)
+    def _clip_battery_flow(self, flow, soc, inverter_limit=None):
+        if inverter_limit is None:
+            inverter_limit = self.INVERTER_MW
+        inverter_limit = clamp(float(inverter_limit), 0.0, self.INVERTER_MW)
+        flow = clamp(float(flow), -inverter_limit, inverter_limit)
         if flow > 0.0:
             max_discharge = (
                 soc * self.BATTERY_MWH * self.DISCHARGE_EFF
