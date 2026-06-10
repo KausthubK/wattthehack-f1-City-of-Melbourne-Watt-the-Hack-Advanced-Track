@@ -8,10 +8,376 @@ branch depends on a scenario name.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
-from strategy_task2 import Strategy as ForecastPlanner
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+
+class ControllerMemory:
+    def __init__(self) -> None:
+        self.last_time: int | None = None
+        self.last_soc: float | None = None
+        self.last_net_grid_power_mw: float | None = None
+        self.last_grid_power_mw: float | None = None
+        self.observed_slots: set[int] = set()
+        self.prior_scaled = False
+
+
+class ActionCosts:
+    def __init__(self) -> None:
+        self.dt_hours = 0.25
+        self.battery_capacity_mwh = 100.0
+        self.max_inverter_mw = 50.0
+        self.grid_max_import_mw = 120.0
+        self.grid_max_export_mw = 50.0
+        self.charge_efficiency = 0.95
+        self.discharge_efficiency = 0.95
+        self.max_diesel_mw = 50.0
+
+        self.export_tariff_per_mwh = 50.0
+        self.diesel_cost_per_mwh = 1000.0
+        self.blackout_penalty_per_mwh = 100000.0
+        self.overvoltage_penalty_per_mwh = 5000.0
+        self.battery_wear_per_mwh = 50.0
+        self.demand_charge_per_mw = 1000.0
+        self.carbon_price_per_kg = 125.0
+        self.default_grid_co2_kg_per_mwh = 0.7
+        self.diesel_co2_kg_per_mwh = 0.27
+        self.ramp_charge_per_mw2 = 0.75
+
+
+class ForecastPlanner:
+    ACTION_COSTS = ActionCosts()
+    STEPS_PER_DAY = 96
+    PLAN_HORIZON = 96
+    SOC_GRID_POINTS = 31
+
+    def __init__(self) -> None:
+        self.memory = ControllerMemory()
+        (
+            self.demand_profile,
+            self.solar_profile,
+            self.price_profile,
+        ) = self._daily_prior()
+
+    def _observe(self, state: dict[str, Any]) -> None:
+        t = int(state.get("time", 0))
+        demand = float(state.get("demand", 0.0))
+        solar = float(state.get("solar", 0.0))
+        price = float(state.get("price", 0.0))
+        soc = self._clip(float(state.get("soc", 0.5)), 0.0, 1.0)
+        slot = t % self.STEPS_PER_DAY
+
+        self._scale_prior_once(slot, demand, price)
+        self.demand_profile[slot] = demand
+        self.solar_profile[slot] = solar
+        self.price_profile[slot] = price
+        self.memory.observed_slots.add(slot)
+
+        self.memory.last_time = t
+        self.memory.last_soc = soc
+        self.memory.last_net_grid_power_mw = demand - solar
+
+    def _build_plan(
+        self, state: dict[str, Any], t: int
+    ) -> tuple[list[float], list[float], list[float]]:
+        forecast = state.get("forecast") or {}
+        forecast_demand = list(forecast.get("demand") or [])
+        forecast_solar = list(forecast.get("solar") or [])
+        forecast_price = list(forecast.get("price") or [])
+        alert_ids = {alert.get("id") for alert in state.get("alerts", [])}
+        if "evening_price_bias" in alert_ids:
+            forecast_price = [max(0.0, value - 90.0) for value in forecast_price]
+        if "dawn_demand_bias" in alert_ids:
+            adjusted_demand = []
+            for h, value in enumerate(forecast_demand):
+                future_tod = (t + h) % self.STEPS_PER_DAY
+                if 18 <= future_tod <= 25:
+                    adjusted_demand.append(value + 50.0)
+                else:
+                    adjusted_demand.append(value)
+            forecast_demand = adjusted_demand
+
+        forecast_len = min(
+            len(forecast_demand),
+            len(forecast_solar),
+            len(forecast_price),
+        )
+
+        demand_plan: list[float] = []
+        solar_plan: list[float] = []
+        price_plan: list[float] = []
+        for h in range(self.PLAN_HORIZON):
+            if h == 0:
+                demand_plan.append(float(state.get("demand", 0.0)))
+                solar_plan.append(float(state.get("solar", 0.0)))
+                price_plan.append(float(state.get("price", 0.0)))
+            elif h < forecast_len:
+                future_tod = (t + h) % self.STEPS_PER_DAY
+                demand_plan.append(float(forecast_demand[h]))
+                solar_plan.append(float(forecast_solar[h]))
+                price = float(forecast_price[h])
+                if 63 <= future_tod <= 80:
+                    price_plan.append(max(0.0, price - 30.0))
+                else:
+                    price_plan.append(price)
+            else:
+                slot = (t + h) % self.STEPS_PER_DAY
+                demand_plan.append(self.demand_profile[slot])
+                solar_plan.append(self.solar_profile[slot])
+                price_plan.append(self.price_profile[slot])
+
+        return demand_plan, solar_plan, price_plan
+
+    def _peak_shaving_diesel(
+        self,
+        *,
+        state: dict[str, Any],
+        net_before_diesel_mw: float,
+        diesel_mw: float,
+        target_import_mw: float,
+        price_trigger: float,
+    ) -> float:
+        time_of_day = int(state.get("time", 0)) % self.STEPS_PER_DAY
+        price = float(state.get("price", 0.0))
+        peak_seen = float(state.get("peak_import_mw") or 0.0)
+
+        if peak_seen > target_import_mw:
+            return diesel_mw
+
+        in_spike_window = 18 <= time_of_day <= 25 or 68 <= time_of_day <= 80
+        if not in_spike_window and price < price_trigger:
+            return diesel_mw
+
+        grid_after_required_diesel = net_before_diesel_mw - diesel_mw
+        if grid_after_required_diesel <= target_import_mw:
+            return diesel_mw
+
+        extra_diesel_mw = grid_after_required_diesel - target_import_mw
+        return self._clip(
+            diesel_mw + extra_diesel_mw,
+            0.0,
+            self.ACTION_COSTS.max_diesel_mw,
+        )
+
+    def _required_reliability_discharge(self, demand: float, solar: float) -> float:
+        return max(
+            0.0,
+            demand
+            - solar
+            - self.ACTION_COSTS.grid_max_import_mw
+            - self.ACTION_COSTS.max_diesel_mw,
+        )
+
+    def _plan_next_soc(
+        self,
+        *,
+        soc: float,
+        demand_plan: list[float],
+        solar_plan: list[float],
+        price_plan: list[float],
+        peak_seen: float,
+        grid_co2: float,
+        previous_grid_mw: float | None = None,
+    ) -> float:
+        if np is None:
+            return self._fallback_target_soc(
+                soc=soc,
+                demand_plan=demand_plan,
+                solar_plan=solar_plan,
+                price_plan=price_plan,
+                peak_seen=peak_seen,
+            )
+
+        costs = self.ACTION_COSTS
+        levels = np.linspace(0.0, 1.0, self.SOC_GRID_POINTS)
+        n = len(levels)
+        horizon = len(demand_plan)
+
+        soc_i = levels[:, None]
+        soc_j = levels[None, :]
+        flows = np.zeros((n, n))
+
+        charge_mask = soc_j > soc_i
+        flows[charge_mask] = -(
+            (soc_j - soc_i)[charge_mask] * costs.battery_capacity_mwh
+        ) / (costs.charge_efficiency * costs.dt_hours)
+
+        discharge_mask = soc_j < soc_i
+        flows[discharge_mask] = (
+            (soc_i - soc_j)[discharge_mask]
+            * costs.battery_capacity_mwh
+            * costs.discharge_efficiency
+        ) / costs.dt_hours
+
+        valid_flow = (
+            (flows >= -costs.max_inverter_mw)
+            & (flows <= costs.max_inverter_mw)
+        )
+        battery_wear = np.abs(flows) * costs.dt_hours * costs.battery_wear_per_mwh
+
+        value = np.zeros((horizon + 1, n))
+        policy = np.zeros((horizon, n), dtype=int)
+        planning_peak = max(peak_seen, 0.0)
+
+        for h in range(horizon - 1, -1, -1):
+            demand = demand_plan[h]
+            solar = solar_plan[h]
+            price = price_plan[h]
+
+            raw_grid = demand - solar - flows
+            diesel = np.minimum(
+                np.maximum(0.0, raw_grid - costs.grid_max_import_mw),
+                costs.max_diesel_mw,
+            )
+            grid_after_diesel = raw_grid - diesel
+            curtail = np.minimum(
+                solar,
+                np.maximum(0.0, -costs.grid_max_export_mw - grid_after_diesel),
+            )
+            net_grid = grid_after_diesel + curtail
+
+            import_mwh = np.maximum(0.0, net_grid * costs.dt_hours)
+            export_mwh = np.minimum(0.0, net_grid * costs.dt_hours)
+            diesel_mwh = diesel * costs.dt_hours
+
+            tariff = import_mwh * price + export_mwh * costs.export_tariff_per_mwh
+            diesel_cost = diesel_mwh * costs.diesel_cost_per_mwh
+            carbon_cost = (
+                import_mwh * grid_co2
+                + diesel_mwh * costs.diesel_co2_kg_per_mwh
+            ) * costs.carbon_price_per_kg
+
+            demand_charge_rate = costs.demand_charge_per_mw
+            if h > 0:
+                demand_charge_rate *= 0.25
+            demand_charge = (
+                np.maximum(0.0, net_grid - planning_peak) * demand_charge_rate
+            )
+
+            ramp_charge = 0.0
+            if h == 0 and previous_grid_mw is not None:
+                ramp_charge = (
+                    (net_grid - previous_grid_mw) ** 2
+                ) * costs.ramp_charge_per_mw2
+
+            cost = (
+                tariff
+                + diesel_cost
+                + carbon_cost
+                + battery_wear
+                + demand_charge
+                + ramp_charge
+            )
+            cost[~valid_flow] = np.inf
+
+            total = cost + value[h + 1][None, :]
+            value[h] = np.min(total, axis=1)
+            policy[h] = np.argmin(total, axis=1)
+
+        current_idx = int(np.argmin(np.abs(levels - soc)))
+        next_idx = int(policy[0, current_idx])
+        return float(levels[next_idx])
+
+    def _fallback_target_soc(
+        self,
+        *,
+        soc: float,
+        demand_plan: list[float],
+        solar_plan: list[float],
+        price_plan: list[float],
+        peak_seen: float,
+    ) -> float:
+        net_now = demand_plan[0] - solar_plan[0]
+        price_now = price_plan[0]
+        future_nets = [d - s for d, s in zip(demand_plan[:24], solar_plan[:24])]
+        future_prices = price_plan[:24]
+
+        high_net_soon = max(future_nets) if future_nets else net_now
+        high_price = max(future_prices) if future_prices else price_now
+
+        if -net_now > 5.0:
+            return 0.95
+        if (
+            net_now > 0.0
+            and (price_now >= 0.75 * high_price or net_now >= 0.75 * high_net_soon)
+        ):
+            return 0.08
+        if high_net_soon > max(peak_seen, 80.0):
+            return max(soc, 0.65)
+        return self._clip(soc, 0.25, 0.80)
+
+    def _flow_to_target(self, soc: float, target_soc: float) -> float:
+        costs = self.ACTION_COSTS
+        if target_soc > soc:
+            return -((target_soc - soc) * costs.battery_capacity_mwh) / (
+                costs.charge_efficiency * costs.dt_hours
+            )
+        if target_soc < soc:
+            return (
+                (soc - target_soc)
+                * costs.battery_capacity_mwh
+                * costs.discharge_efficiency
+            ) / costs.dt_hours
+        return 0.0
+
+    def _clip_battery_flow(self, flow: float, soc: float) -> float:
+        costs = self.ACTION_COSTS
+        flow = self._clip(float(flow), -costs.max_inverter_mw, costs.max_inverter_mw)
+        if flow > 0.0:
+            max_discharge = (
+                soc * costs.battery_capacity_mwh * costs.discharge_efficiency
+            ) / costs.dt_hours
+            return min(flow, max_discharge)
+        if flow < 0.0:
+            max_charge = ((1.0 - soc) * costs.battery_capacity_mwh) / (
+                costs.charge_efficiency * costs.dt_hours
+            )
+            return max(flow, -max_charge)
+        return 0.0
+
+    def _daily_prior(self) -> tuple[list[float], list[float], list[float]]:
+        demand: list[float] = []
+        solar: list[float] = []
+        price: list[float] = []
+        for slot in range(self.STEPS_PER_DAY):
+            phase = slot / self.STEPS_PER_DAY
+
+            morning = math.exp(-((phase - 0.33) / 0.09) ** 2)
+            evening = math.exp(-((phase - 0.79) / 0.10) ** 2)
+            demand.append(35.0 + 15.0 * morning + 75.0 * evening)
+
+            if 0.25 < phase < 0.75:
+                solar_phase = (phase - 0.25) / 0.50
+                solar.append(120.0 * math.sin(math.pi * solar_phase))
+            else:
+                solar.append(0.0)
+
+            midday = math.exp(-((phase - 0.50) / 0.14) ** 2)
+            price.append(100.0 + 400.0 * evening - 80.0 * midday)
+
+        return demand, solar, price
+
+    def _scale_prior_once(self, slot: int, demand: float, price: float) -> None:
+        if self.memory.prior_scaled:
+            return
+
+        demand_base = max(1.0, self.demand_profile[slot])
+        price_base = max(1.0, self.price_profile[slot])
+        demand_scale = self._clip(demand / demand_base, 0.75, 1.35)
+        price_scale = self._clip(price / price_base, 0.50, 2.00)
+        self.demand_profile = [value * demand_scale for value in self.demand_profile]
+        self.price_profile = [value * price_scale for value in self.price_profile]
+        self.memory.prior_scaled = True
+
+    @staticmethod
+    def _clip(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
 
 
 class Strategy(ForecastPlanner):
